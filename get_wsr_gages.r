@@ -334,7 +334,7 @@ for(i in 1:nrow(good_gages)){
            grepl("A|P", X_00060_00003_cd, ignore.case = FALSE))
   
   if(nrow(enough) >= 9497 * 0.85){
-  write_csv(enough, paste0("data/nwis_data/inside/", good_gages[i,]$site_no))
+  write_csv(enough, paste0("data/nwis_data/inside/", good_gages[i,]$site_no, ".csv"))
   }
   
 }
