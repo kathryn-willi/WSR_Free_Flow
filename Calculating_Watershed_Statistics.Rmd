@@ -1,0 +1,196 @@
+---
+title: "3_Calculating_Watershed_Characteristics"
+author: "Katie Willi"
+date: "2025-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(sf)
+library(caret)
+library(terra)
+library(elevatr)
+library(dataRetrieval)
+library(nhdplusTools)
+library(StreamCatTools)
+library(tmap)
+library(climateR)
+library(data.table)
+library(mapview)
+list.files("src/", full.names = TRUE) %>% walk(~source(.))
+```
+
+Pull in our WSR gage watersheds:
+
+```{r}
+watersheds <- list.files("data/nwis_ws_backup/", full.names = TRUE) %>%
+  map(~readRDS(.)) %>%
+  bind_rows() %>%
+  rowid_to_column("index")
+```
+
+Pull in our outside WSR gage watersheds:
+```{r}
+test = st_read("data/archive/shapefiles/watersheds.shp")
+
+mapview(test)
+```
+
+```{r}
+
+```
+
+
+
+
+##### STATSGO data from StreamCate
+
+```{r}
+selected_vars <- c(
+  # Soil, STATSGO variables:
+  "Clay", "Sand", "Rckdep", "WtDep", "Perm") %>% 
+  tolower()
+
+streamcat_sim <- watersheds %>%
+  simple_streamcat_data(.) %>%
+  mutate(across(where(is.numeric), ~ifelse(is.nan(.), 0, .))) %>%
+  mutate(across(where(is.numeric), ~ifelse(. < 0, 0, .))) %>%
+  st_drop_geometry() %>%
+  rename_with(~ paste0(., "_streamcat"), -index) 
+```
+
+##### Aspect features
+
+Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there's an easier approach than what I'm presenting here. I grab raw elevation DEMs, get the aspect (in degrees) for each grid cell, then convert those raw aspects (in degrees) into categorical N, E, S, W cardinal directions.
+
+```{r}
+watersheds_aspects <- watersheds %>%
+  aspect_grabber(.) %>%
+  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  st_drop_geometry() 
+write_csv(watersheds_aspects, "data/watershed_aspects.csv")
+```
+
+##### Snow persistence
+
+Here I am loading in all the snow persistence data I downloaded from: https://www.sciencebase.gov/catalog/item/5f63790982ce38aaa23a3930. There is annual snow persistence data from 2001-2020. Using the {terra} package, I get the area-weighted annual average snow persistence value for each watershed, then average each year's data together to get a single time- and area-weighted average for each watershed.
+
+```{r}
+watersheds_sp <- watersheds %>%
+  snow_persistence_grabber(.) %>%
+  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  st_drop_geometry()
+```
+
+##### Daymet variables
+
+```{r}
+watersheds_daymet <- watersheds %>%
+  daymet_grabber(.) %>%
+  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  st_drop_geometry() %>%
+  select(-c(swe_avg_sum, swe_jul, swe_aug, swe_sep, swe_oct, swe_nov, swe_dec))
+```
+
+
+##### gridMET variables
+```{r}
+watersheds_pet <- watersheds %>%
+  get_climate_historic_frac_overlap(.)
+
+pet_avg <- watersheds_pet %>%
+  as.data.table() %>%
+  mutate(wyear = ifelse(month(date) >= 10, year(date) + 1, year(date))) %>%
+  group_by(site_no, x, y, area_weight, wyear) %>%
+  summarize(total_pet = sum(pet, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(site_no, x, y, area_weight) %>%
+  summarize(mean_tot_pet = mean(total_pet)) %>%
+  ungroup() %>%
+  group_by(site_no) %>%
+  summarize(
+    avg_tot_pet = sum(mean_tot_pet * area_weight) / sum(area_weight),
+    .groups = "drop"
+  ) %>%
+  rename(index = site_no)
+```
+
+##### Geology variables
+
+```{r}
+watersheds_geology <- watersheds %>%
+  geology_grabber(.) %>%
+  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  st_drop_geometry()
+
+# Vector of geology column names
+geology_cols <- c(
+  "perc_intrusive", "perc_metamorphic", "perc_volcanic",
+  "perc_sedimentary_clastic", "perc_sedimentary_chemical",
+  "perc_sedimentary_carbonate", "perc_unconsolidated", "perc_mix"
+)
+
+# create dominant_geology column
+watersheds_geology <- watersheds_geology %>%
+  rowwise() %>%
+  mutate(dominant_geology = sub("^perc_", "", geology_cols[which.max(c_across(all_of(geology_cols)))])) %>%
+  ungroup() %>%
+  select(index, dominant_geology)
+```
+
+##### NLCD variables
+
+```{r}
+watersheds_nlcd <- watersheds %>%
+  nlcd_grabber(.) %>%
+  st_drop_geometry() %>%
+  select(index, Forest_Percent, Grassland_Percent,
+         Shrub_Percent, Agriculture_Percent, Impervious_Percent)
+```
+
+##### Road density
+```{r}
+watersheds_roads <- watersheds %>%
+  road_density_grabber() %>%
+  select(index, road_density_km_per_km2) %>%
+  st_drop_geometry()
+```
+
+##### Percent Burned
+```{r}
+watersheds_burned <- watersheds %>%
+  fire_grabber(.) %>%
+  st_drop_geometry() %>%
+  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) 
+```
+
+##### Dominant Hydroregion
+```{r}
+watersheds_hydroregion <- watersheds %>%
+  find_dominant_hydroregion(.)
+```
+
+#### Bind all together:
+```{r}
+watersheds_with_vars <- watersheds %>%
+  left_join(watersheds_aspects, by = "index") %>%
+  left_join(watersheds_daymet, by = "index") %>%
+  left_join(pet_avg, by = "index") %>%
+  left_join(watersheds_sp, by = "index") %>%
+  left_join(watersheds_geology, by = "index") %>%
+  left_join(watersheds_nlcd, by = "index") %>%
+  left_join(watersheds_roads, by = "index") %>%
+  left_join(streamcat_sim, by = "index") %>%
+  left_join(watersheds_burned, by = "index") %>%
+  st_drop_geometry()
+
+names(watersheds_with_vars) <- tolower(names(watersheds_with_vars))
+
+write_csv(watersheds_with_vars, "data/watersheds_with_vars.csv")
+st_write(watersheds, "data/watersheds_shapefile.shp", append = FALSE)
+```
