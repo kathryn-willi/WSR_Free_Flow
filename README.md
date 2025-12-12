@@ -1,6 +1,6 @@
 Will this work?
 
-```{r}
+```{r, eval = TRUE}
 library(tidyverse)
 
 4+4
