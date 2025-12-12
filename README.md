@@ -1,7 +1,1 @@
-Will this work?
-
-```{r, eval = TRUE}
-library(tidyverse)
-
-4+4
-```
+Code to accompany the thesis, "Are Wild and Scenic Rivers Really Free-Flowing"?
