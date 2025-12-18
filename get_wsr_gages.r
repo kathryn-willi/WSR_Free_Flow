@@ -163,7 +163,6 @@ getXYWatersheds <- function(sf = NULL, coordinates = NULL, crs = NULL){
   
 }  
 
-
 ws <- vector("list", length = nrow(all_tips))
 
 for(i in 1:nrow(all_tips)){
@@ -171,7 +170,7 @@ for(i in 1:nrow(all_tips)){
   try(ws[[i]] <- getXYWatersheds(sf = all_tips[i,]) %>%
         mutate(WSR = all_tips[i,]$WSR_RIVER_,
                state = all_tips[i,]$STATE) %>%
-        saveRDS(paste0("data/wsr_ws_backup//", all_tips[i,]$rowid, ".RDS")))
+        saveRDS(paste0("data/wsr_ws_backup/", all_tips[i,]$rowid, ".RDS")))
   Sys.sleep(3)
   
 }
@@ -196,7 +195,7 @@ for(i in 1:nrow(missing)){
 
 
 
-test1 <- list.files("data/wsr_ws_backup//", full.names = TRUE) %>% #[1:500] %>%
+test1 <- list.files("data/wsr_ws_backup/", full.names = TRUE) %>% #[1:500] %>%
   map(~readRDS(.)) %>%
   bind_rows() %>%
   filter(!WSR %in% c("White Clay Wild and Scenic River", "Great Egg Harbor Wild and Scenic River", 
@@ -206,7 +205,7 @@ test1 <- list.files("data/wsr_ws_backup//", full.names = TRUE) %>% #[1:500] %>%
   summarize() %>%
   nngeo::st_remove_holes()
 
-test2 <- list.files("data/wsr_ws_backup//", full.names = TRUE) %>%
+test2 <- list.files("data/wsr_ws_backup/", full.names = TRUE) %>%
   map(~readRDS(.)) %>%
   bind_rows() %>%
   filter(WSR %in% c("White Clay Wild and Scenic River", "Great Egg Harbor Wild and Scenic River", 
@@ -229,10 +228,12 @@ final_watersheds <- bind_rows(test1, test2) %>%
   nngeo::st_remove_holes()
 
 river_corridors <- rivers %>%
-  st_transform(crs = 32616) %>% 
+  dplyr::mutate(WSR = WSR_RIVER_, state = STATE) %>%
+  sf::st_transform(crs = 32616) %>% 
   st_buffer(402.336, endCapStyle = "FLAT") %>% # quarter mile around lines
   rowid_to_column() %>%
-  st_transform(4269)
+  st_transform(4269) %>%
+  select(WSR, state)
 
 listNWIS <- function(aoi = NULL){
   
@@ -296,19 +297,17 @@ listNWIS <- function(aoi = NULL){
                     begin_date,
                     end_date,
                     code = parm_cd)) %>%
-    sf::st_join(., dplyr::select(aoi, WSR_RIVER_ = WSR, state))
+    sf::st_join(., dplyr::select(aoi, WSR, state))
   
   return(inventory)
   
 }
 
 mainstem <- listNWIS(aoi = river_corridors) %>%
-  mutate(location = "MAINSTEM") %>%
-  rename(WSR = WSR_RIVER_)
+  mutate(location = "MAINSTEM") 
 
-watershed <- listNWIS(aoi = final_watersheds) %>%
-  mutate(location = "WATERSHED") %>%
-  rename(STATE = state)
+watershed <- listNWIS(aoi = final_watersheds %>% rename(WSR_RIVER_ = WSR, STATE = state)) %>%
+  mutate(location = "WATERSHED") 
 
 # Need >85% data availability for at least 20 years between water years 2000-2024
 all_gages <- bind_rows(mainstem, watershed) %>%
@@ -324,7 +323,7 @@ good_gages <- all_gages %>%
 
 for(i in 1:nrow(good_gages)){
   
-  data <- readNWISdv(siteNumber = good_gages[i,]$site_no, 
+  data <- readNWISdv(siteNumber = good_gages[i,], 
                      parameterCd = "00060",
                      startDate = "1999-10-01",
                      endDate = "2025-09-30")
@@ -334,7 +333,7 @@ for(i in 1:nrow(good_gages)){
            grepl("A|P", X_00060_00003_cd, ignore.case = FALSE))
   
   if(nrow(enough) >= 9497 * 0.85){
-  write_csv(enough, paste0("data/nwis_data/inside/", good_gages[i,]$site_no, ".csv"))
+  write_csv(enough, paste0("data/nwis_data/inside/", good_gages[i,], ".csv"))
   }
   
 }
