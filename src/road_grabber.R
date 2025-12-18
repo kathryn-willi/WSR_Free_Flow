@@ -1,72 +1,73 @@
-road_density_grabber <- function(watersheds){
+road_density_grabber <- function(watersheds, download = TRUE){
   
-  # # Get states data to determine which states to fetch counties from
-  # states <- tigris::states()
-  # 
-  # if(crs(watersheds) != crs(states)){
-  #   states <- st_transform(states, crs(watersheds))
-  # }
-  # 
-  # # Find overlapping states (using st_intersects for speed)
-  # state_intersects <- st_intersects(watersheds, states, sparse = TRUE)
-  # overlapping_states <- states[unlist(state_intersects), ]
-  # 
-  # # Only fetch counties for states that overlap with our watersheds
-  # overlapping_counties <- data.frame()
-  # 
-  # state_fips <- overlapping_states$STATEFP
-  # 
-  # # Get counties only for the states that intersect
-  # counties <- tigris::counties(state = state_fips, cb = TRUE, resolution = "20m")
-  # counties <- st_transform(counties, st_crs(watersheds))
-  # 
-  # # Find overlapping counties
-  # county_intersects <- st_join(watersheds, counties, left = TRUE) %>%
-  #   st_drop_geometry() %>%
-  #   select(index, STATEFP, COUNTYFP) %>%
-  #   distinct()
-  # 
-  # table <- vector("list", length = nrow(watersheds))
-  # 
-  # for(i in 1:nrow(watersheds)){
-  #   
-  #   sub <- county_intersects %>%
-  #     filter(index == watersheds[i,]$index)
-  #   
-  #   roads <- vector("list", length = nrow(sub))
-  #   
-  #   for(j in 1:nrow(sub)){
-  #     roads[[i]] <- tigris::roads(state = sub[j,]$STATEFP, county = sub[j,]$COUNTYFP)
-  #   }
-  #   
-  #   table[[i]] <- bind_rows(roads)
-  #   
-  # }
-  # 
-  # 
-  # all_roads <- bind_rows(table)
-  # if(crs(all_roads) != crs(watersheds)){
-  #   all_roads <- all_roads %>% st_transform(crs(watersheds))
-  # }
   
-  # saveRDS(all_roads, "data/katie/all_roads.RDS")
+  if(download == TRUE){
+   # Get states data to determine which states to fetch counties from
+   states <- tigris::states()
   
-  all_roads <- readRDS("data/all_roads.RDS") 
-  if(crs(all_roads) != crs(watersheds)){
-    all_roads <- all_roads %>% st_transform(crs(watersheds))
+   if(crs(watersheds) != crs(states)){
+     states <- st_transform(states, crs(watersheds))
+   }
+  
+   # Find overlapping states (using st_intersects for speed)
+   state_intersects <- st_intersects(watersheds, states, sparse = TRUE)
+   overlapping_states <- states[unlist(state_intersects), ]
+  
+   # Only fetch counties for states that overlap with our watersheds
+   overlapping_counties <- data.frame()
+  
+   state_fips <- overlapping_states$STATEFP
+  
+   # Get counties only for the states that intersect
+  counties <- tigris::counties(state = state_fips, cb = TRUE, resolution = "20m")
+  counties <- st_transform(counties, st_crs(watersheds))
+  
+   # Find overlapping counties
+   county_intersects <- st_join(watersheds, counties, left = TRUE) %>%
+     st_drop_geometry() %>%
+     select(index, STATEFP, COUNTYFP) %>%
+     distinct()
+  
+   #table <- vector("list", length = nrow(watersheds))
+  
+   for(i in 1:nrow(watersheds)){
+  
+     sub <- county_intersects %>%
+       filter(index == watersheds[i,]$index)
+  
+     roads <- vector("list", length = nrow(sub))
+  
+     for(j in 1:nrow(sub)){
+     roads[[i]] <- tigris::roads(state = sub[j,]$STATEFP, county = sub[j,]$COUNTYFP)
+     }
+  
+     table <- bind_rows(roads) 
+     
+     if(crs(table) != crs(watersheds)){
+       table <- table %>% st_transform(crs(watersheds))
+     }
+
+     saveRDS(table, paste0("data/roads/", watersheds[i,]$index,".RDS"))
+     
+     print(i)
+   }
   }
   
-  all_roads <- all_roads %>%
-    as.data.table() %>%
-    distinct() %>%
-    st_as_sf() %>%
-    .[watersheds,]
-  
+  # saveRDS(all_roads, "data/roads.RDS")
+  # 
+  # all_roads <- all_roads %>%
+  #   as.data.table() %>%
+  #   distinct() %>%
+  #   st_as_sf() %>%
+  #   .[watersheds,]
+  # 
   road_lengths <- vector("list", length = nrow(watersheds))
   
   for(i in 1:nrow(watersheds)){
     
     ws <- watersheds[i,]
+    
+    all_roads <- readRDS(paste0("data/roads/", watersheds[i,]$index, ".RDS"))
     
     # Intersect all roads with all watersheds
     intersection <- all_roads %>%
