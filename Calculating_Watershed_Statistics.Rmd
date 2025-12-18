@@ -26,26 +26,33 @@ list.files("src/", full.names = TRUE) %>% walk(~source(.))
 ```
 
 Pull in our WSR gage watersheds:
-
 ```{r}
-watersheds <- list.files("data/nwis_ws_backup/", full.names = TRUE) %>%
+watersheds_inside <- list.files("data/nwis_ws_backup/inside", full.names = TRUE) %>%
   map(~readRDS(.)) %>%
   bind_rows() %>%
-  rowid_to_column("index")
+  rowid_to_column("index") %>%
+  st_transform(4326)
 ```
 
 Pull in our outside WSR gage watersheds:
 ```{r}
-test = st_read("data/archive/shapefiles/watersheds.shp")
+outside_list <- str_remove(list.files("data/nwis_data/outside"), "\\.csv$")
 
-mapview(test)
+watersheds_outside <- st_read("data/nwis_ws_backup/outside/") %>% # also found at: "data/archive/shapefiles/watersheds.shp"
+  filter(!site_no %in% watersheds_inside$site_no &
+           site_no %in% outside_list) %>%
+  left_join(., read_csv("data/nwis_data/all_outside_gages.csv"), by = "site_no") %>%
+  select(site_no, comid) %>%
+  st_transform(4326)
 ```
 
+Bind together:
 ```{r}
-
+watersheds <- bind_rows(watersheds_inside, watersheds_outside) %>%
+  select(site_no, comid) %>%
+  rowid_to_column(var = "index") %>%  
+  .[1:2,]
 ```
-
-
 
 
 ##### STATSGO data from StreamCate
@@ -71,7 +78,6 @@ Dominant aspect requires a bit of a wonky workflow - I'm not quite sure if there
 ```{r}
 watersheds_aspects <- watersheds %>%
   aspect_grabber(.) %>%
-  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
   st_drop_geometry() 
 write_csv(watersheds_aspects, "data/watershed_aspects.csv")
 ```
@@ -83,7 +89,7 @@ Here I am loading in all the snow persistence data I downloaded from: https://ww
 ```{r}
 watersheds_sp <- watersheds %>%
   snow_persistence_grabber(.) %>%
-  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  select(-c(comid)) %>% 
   st_drop_geometry()
 ```
 
@@ -92,7 +98,7 @@ watersheds_sp <- watersheds %>%
 ```{r}
 watersheds_daymet <- watersheds %>%
   daymet_grabber(.) %>%
-  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  select(-c(comid)) %>% 
   st_drop_geometry() %>%
   select(-c(swe_avg_sum, swe_jul, swe_aug, swe_sep, swe_oct, swe_nov, swe_dec))
 ```
@@ -101,7 +107,8 @@ watersheds_daymet <- watersheds %>%
 ##### gridMET variables
 ```{r}
 watersheds_pet <- watersheds %>%
-  get_climate_historic_frac_overlap(.)
+  select(-site_no) %>%
+  get_climate_historic_frac_overlap(., col_name = "index")
 
 pet_avg <- watersheds_pet %>%
   as.data.table() %>%
@@ -125,7 +132,7 @@ pet_avg <- watersheds_pet %>%
 ```{r}
 watersheds_geology <- watersheds %>%
   geology_grabber(.) %>%
-  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) %>% 
+  select(-c(comid)) %>% 
   st_drop_geometry()
 
 # Vector of geology column names
@@ -161,20 +168,6 @@ watersheds_roads <- watersheds %>%
   st_drop_geometry()
 ```
 
-##### Percent Burned
-```{r}
-watersheds_burned <- watersheds %>%
-  fire_grabber(.) %>%
-  st_drop_geometry() %>%
-  select(-c(comid, ws_area_sqkm, usgs_id, cdwr_id)) 
-```
-
-##### Dominant Hydroregion
-```{r}
-watersheds_hydroregion <- watersheds %>%
-  find_dominant_hydroregion(.)
-```
-
 #### Bind all together:
 ```{r}
 watersheds_with_vars <- watersheds %>%
@@ -186,7 +179,6 @@ watersheds_with_vars <- watersheds %>%
   left_join(watersheds_nlcd, by = "index") %>%
   left_join(watersheds_roads, by = "index") %>%
   left_join(streamcat_sim, by = "index") %>%
-  left_join(watersheds_burned, by = "index") %>%
   st_drop_geometry()
 
 names(watersheds_with_vars) <- tolower(names(watersheds_with_vars))
