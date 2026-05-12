@@ -41,7 +41,7 @@ outside_list <- str_remove(list.files("data/nwis_data/outside"), "\\.csv$")
 watersheds_outside <- st_read("data/nwis_ws_backup/outside/") %>% # also found at: "data/archive/shapefiles/watersheds.shp"
   filter(!site_no %in% watersheds_inside$site_no &
            site_no %in% outside_list) %>%
-  left_join(., read_csv("data/nwis_data/all_outside_gages.csv"), by = "site_no") %>%
+  left_join(., read_csv("data/nwis_data/all_outside_gages.csv") %>% select(site_no, comid), by = "site_no") %>%
   select(site_no, comid) %>%
   st_transform(4326)
 ```
@@ -51,7 +51,7 @@ Bind together:
 watersheds <- bind_rows(watersheds_inside, watersheds_outside) %>%
   select(site_no, comid) %>%
   rowid_to_column(var = "index") %>%  
-  .[1:2,]
+  mutate(area = st_area(.))
 ```
 
 

@@ -1,0 +1,287 @@
+---
+  title: "Model_Selection"
+author: "Katie Willi"
+date: "2025-05-07"
+output: html_document
+---
+  
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)   
+library(hydroGOF)     # evaluation metrics (NSE, PBIAS, RMSE)
+library(caret)        # model training and cross-validation
+library(leaps)        # mlr variable selection
+library(randomForest) # random forest mode
+library(DT)
+library(slickR)
+library(broom)
+library(MuMIn)
+library(furrr)
+```
+
+## Data tidying
+
+Munge all the different datasets together to get a single dataframe containing all sites, flow stats, and predictor variables:
+
+```{r}
+flow <- read_csv("data/archive/dataset_20250623_2.csv") %>%
+  select(
+    index, gage_used,
+    all_jan_Q_mmd, all_feb_Q_mmd, all_mar_Q_mmd, all_apr_Q_mmd, all_may_Q_mmd, all_jun_Q_mmd,
+    all_jul_Q_mmd, all_aug_Q_mmd, all_sep_Q_mmd, all_oct_Q_mmd, all_nov_Q_mmd, all_dec_Q_mmd,
+    all_Q_ann_mm,
+    all_annual_mean_max_Q_mmd, all_annual_mean_min_Q_mmd,
+    all_annual_mean_Q_mmd, all_q95_Q_mmd, all_q5_Q_mmd,
+    all_mean_flowdate_0.1, all_mean_flowdate_0.2, all_mean_flowdate_0.3, all_mean_flowdate_0.4,
+    all_mean_flowdate_0.5, all_mean_flowdate_0.6, all_mean_flowdate_0.7, all_mean_flowdate_0.8,
+    all_mean_flowdate_0.9, all_monsoon_frac,
+    flood_freq_1.5_Q_mmd
+  ) %>%
+  rename_with(tolower)
+
+predictors <- read_csv("data/0-FINAL-DELIVERABLES/watersheds_with_vars_20250624.csv") %>%
+  select(-c(gage_used, percent_burned))
+
+vars <- flow %>%
+  inner_join(predictors, by = "index") %>%
+  select(index, name, gage_used, cdwr_id, usgs_id, comid, everything()) %>%
+  # These are severe outliers so we remove them:
+  filter(!gage_used %in% c("9358550", "LUARMOCO"))
+```
+
+
+```{r}
+all_flow_stats <- vars %>%
+  select(all_jan_q_mmd, all_feb_q_mmd, all_mar_q_mmd, all_apr_q_mmd, all_may_q_mmd, all_jun_q_mmd,
+         all_jul_q_mmd, all_aug_q_mmd, all_sep_q_mmd, all_oct_q_mmd, all_nov_q_mmd, all_dec_q_mmd,
+         all_q_ann_mm,
+         all_annual_mean_max_q_mmd, all_annual_mean_min_q_mmd,
+         all_annual_mean_q_mmd, all_q95_q_mmd, all_q5_q_mmd,
+         all_mean_flowdate_0.1, all_mean_flowdate_0.2, all_mean_flowdate_0.3, all_mean_flowdate_0.4,
+         all_mean_flowdate_0.5, all_mean_flowdate_0.6, all_mean_flowdate_0.7, all_mean_flowdate_0.8,
+         all_mean_flowdate_0.9, all_monsoon_frac,
+         flood_freq_1.5_q_mmd) %>%
+  names() %>%
+  tolower()
+
+all_predictor_vars <- names(vars)[c(37:ncol(vars))]
+```
+
+## Model development
+
+For handling collinearity, we first remove highly correlated predictor
+variables (correlation threshold of 0.85), and keep the variable that
+has a stronger correlation with the target flow metric when removing one
+of a pair of highly correlated predictors. This is how CSUFlow18 did it.
+
+We then perform an "exhaustive" search to find the best combination of up to n/15 predictor variables. All y vars are square root transformed, but back-transforms predictions and observations
+for evaluation metrics. The best model is selected based on the highest adjusted R-squared value.
+
+```{r}
+model_flow_metric <- function(metric_index) {
+  yvar <- all_flow_stats[metric_index]
+  print(paste("Predicting:", yvar))
+  
+  month_names <- tolower(month.abb)
+  prcp_months <- paste0("prcp_", month_names)
+  swe_months  <- paste0("swe_", month_names)
+  monthly_vars <- c(prcp_months, swe_months)
+  
+  month <- str_match(yvar, "all_([a-z]{3})_q_mmd")[, 2]
+  
+  if (!is.na(month)) {
+    month_index <- match(month, month_names)
+    prior_months_index <- ((month_index - 3):month_index) %% 12
+    prior_months_index[prior_months_index == 0] <- 12
+    keep_months <- month_names[prior_months_index]
+    
+    keep_prcp <- paste0("prcp_", keep_months)
+    
+    swe_cutoff <- c("jan", "feb", "mar", "apr", "may", "jun")
+    keep_swe_months <- intersect(keep_months, swe_cutoff)
+    keep_swe <- paste0("swe_", keep_swe_months)
+    
+    if (!month %in% swe_cutoff) {
+      keep_swe <- "swe_peak"
+    }
+    
+    other_predictors <- setdiff(all_predictor_vars, monthly_vars)
+    other_predictors <- setdiff(other_predictors, c("swe_peak", "swe_avg",
+                                                    "prcp_avg_sum", "prcp_peak", "prcp_avg"))
+    current_predictors <- c(keep_prcp, keep_swe, other_predictors)
+  } else {
+    current_predictors <- all_predictor_vars
+  }
+  
+  allVars <- c(yvar, current_predictors)
+  df_valid <- vars[, c("gage_used", allVars)] %>% na.omit()
+  site_names <- df_valid$gage_used
+  df_valid <- df_valid[, allVars]
+  
+  y <- df_valid[[yvar]]
+  y_sqrt <- sqrt(y)
+  allX <- df_valid %>% select(all_of(current_predictors))
+  
+  predictors <- allX %>% select(where(is.numeric), -c(hyd_region, dominant_aspect, dominant_geology))
+  corr_matrix <- cor(predictors, use = "pairwise.complete.obs")
+  corr_with_y <- abs(cor(predictors, y_sqrt, use = "pairwise.complete.obs"))
+  
+  vars_to_remove <- c()
+  for(i in 1:(ncol(predictors) - 1)) {
+    for(j in (i + 1):ncol(predictors)) {
+      if(abs(corr_matrix[i, j]) >= 0.85) {
+        if(corr_with_y[i] < corr_with_y[j]) {
+          vars_to_remove <- c(vars_to_remove, colnames(predictors)[i])
+        } else {
+          vars_to_remove <- c(vars_to_remove, colnames(predictors)[j])
+        }
+      }
+    }
+  }
+  
+  
+  predictors_corr_removed <- allX %>% select(-any_of(unique(vars_to_remove)))
+  predictors_names_removed <- names(predictors_corr_removed)
+  
+  group_list <- list(
+    hyd_region = "hyd_region",
+    dominant_aspect = "dominant_aspect",
+    dominant_geology = "dominant_geology"
+  )
+  
+  numeric_vars <- setdiff(predictors_names_removed, c("hyd_region", "dominant_aspect", "dominant_geology"))
+  for (v in numeric_vars) group_list[[v]] <- v
+  group_list <- group_list[lengths(group_list) > 0]
+  group_names <- names(group_list)
+  
+  all_combos <- unlist(
+    lapply(1:min(as.integer(nrow(df_valid) / 15), length(group_names)),
+           function(k) combn(group_names, k, simplify = FALSE)),
+    recursive = FALSE
+  )
+  
+  results <- purrr::map(all_combos, function(groups) {
+    predictors_subset <- unlist(group_list[groups])
+    df_X <- df_valid[, predictors_subset, drop = FALSE]
+    df_X[[yvar]] <- y_sqrt
+    formula <- as.formula(paste("`", yvar, "` ~ ", paste(predictors_subset, collapse = " + "), sep = ""))
+    mod <- tryCatch(lm(formula, data = df_X), error = function(e) NULL)
+    if (!is.null(mod)) {
+      r2 <- summary(mod)$adj.r.squared
+      aic <- AIC(mod)
+      list(groups = groups, formula = formula, r2 = r2, aic = aic, model = mod)
+    } else NULL
+  })
+  
+  results <- compact(results)
+  if (length(results) == 0) return(NULL)
+  
+  best_model <- results[[which.max(map_dbl(results, "r2"))]]
+  katie_best_formula <- best_model$formula
+  katie_final_model <- best_model$model
+  
+  katie_train_predictions <- predict(katie_final_model, newdata = df_valid)^2
+  katie_train_obs <- df_valid[[yvar]]
+  
+  df_valid_sqrt <- df_valid
+  df_valid_sqrt[[yvar]] <- y_sqrt
+  df_valid_sqrt$site_name <- site_names
+  
+  cv_model <- train(katie_best_formula,
+                    data = df_valid_sqrt,
+                    method = "lm",
+                    trControl = trainControl(method = "cv", number = 5, savePredictions = "final"),
+                    metric = "RMSE")
+  
+  cv_pred <- cv_model$pred$pred^2
+  cv_obs <- cv_model$pred$obs^2
+  cv_site_names <- site_names[cv_model$pred$rowIndex]
+  
+  model_comparison <- data.frame(flow_stat = yvar,
+                                 nobs = nrow(df_valid),
+                                 model_type = c("MLR_Train", "MLR_CV"),
+                                 NSE = c(NSE(katie_train_predictions, katie_train_obs), NSE(cv_pred, cv_obs)),
+                                 PBIAS = c(pbias(katie_train_predictions, katie_train_obs), pbias(cv_pred, cv_obs)),
+                                 R2 = c(cor(katie_train_predictions, katie_train_obs)^2, cor(cv_pred, cv_obs)^2),
+                                 RMSE = c(rmse(katie_train_predictions, katie_train_obs), rmse(cv_pred, cv_obs)),
+                                 CV = c(rmse(katie_train_predictions, katie_train_obs) / mean(katie_train_obs) * 100, rmse(cv_pred, cv_obs) / mean(cv_obs) * 100),
+                                 vars = rep(paste(deparse(katie_best_formula), collapse = ""), 2))
+  
+  train_df <- data.frame(flow_stat = yvar, model_type = "MLR_", dataset = "Train",
+                         site_name = site_names, observed = katie_train_obs,
+                         predicted = katie_train_predictions, row_id = 1:nrow(df_valid))
+  
+  cv_df <- data.frame(flow_stat = yvar, model_type = "MLR_", dataset = "CV",
+                      site_name = cv_site_names, observed = cv_obs,
+                      predicted = cv_pred, row_id = cv_model$pred$rowIndex)
+  
+  list(
+    model_stats = model_comparison,
+    obs_pred = bind_rows(train_df, cv_df),
+    model_object = list(model = katie_final_model, formula = katie_best_formula),
+    yvar = yvar
+  )
+}
+
+  results_list <- map(1:length(all_flow_stats), function(i) {
+    res <- model_flow_metric(i)
+    if (is.null(res)) return(NULL)
+    yvar <- res$yvar
+    # save model stats
+    write_csv(res$model_stats, paste0("data/model_results_no_burn/all_model_stats_", yvar, ".csv"))
+    # save observed vs predicted
+    write_csv(res$obs_pred, paste0("data/model_results_no_burn/obs_pred_", yvar, ".csv"))
+    return(res)
+  }
+  )
+
+```
+
+## Saving Models
+
+```{r}
+model_list <- list.files("data/model_results_no_burn/", pattern = "all_model_stats", full.names = TRUE) %>%
+  map_dfr(~read_csv(.)) %>%
+  filter(model_type == "MLR_Train") %>%
+  mutate(flow_stat = tolower(flow_stat))
+
+grab_models <- function(metric_index){
+  
+  yvar <- all_flow_stats[metric_index]
+  
+  print(paste("Grabbing:", yvar))
+  
+  current_predictors <- all_predictor_vars 
+  
+  allVars <- c(yvar, current_predictors)
+  df_valid <- vars[, c(allVars)] %>% na.omit() 
+  
+  model <- model_list %>%
+    filter(model_type == "MLR_Train") %>%
+    filter(flow_stat == yvar) %>%
+    pull(vars) 
+  
+  # get model formula and modify for square root transformation
+  model_formula <- as.formula(model)
+  
+  # create new formula with sqrt transformation of y variable
+  y_var_name <- as.character(model_formula)[2]   # y variable name
+  predictor_terms <- as.character(model_formula)[3] %>% tolower() # predictors
+  
+  # modified formula with sqrt transformation:
+  sqrt_formula <- as.formula(paste("sqrt(", y_var_name, ") ~", predictor_terms) %>% tolower()) 
+  
+  # fit the linear model with square root transformed y variable
+  fitted_model <- lm(sqrt_formula, data = df_valid)
+  
+  filename <- paste0("data/model_obs_no_burn/model_", yvar, ".rds")
+  
+  # save the model as RDS for use in shiny app
+  saveRDS(fitted_model, file = paste0("data/model_obs_no_burn/model_", yvar, ".rds"))
+  
+  return(fitted_model)
+}
+
+unique(1:n_distinct(model_list$flow_stat)) %>%
+  walk(~grab_models(.)) 
+```
+

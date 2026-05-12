@@ -1,0 +1,170 @@
+---
+title: "Calculating_Flow_Stats"
+author: "Katie Willi"
+date: "2025-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+Pull in our gage watersheds to get their areas to convert cfs to mmd:
+```{r}
+watersheds_inside <- list.files("data/nwis_ws_backup/inside", full.names = TRUE) %>%
+  map(~readRDS(.)) %>%
+  bind_rows() %>%
+  rowid_to_column("index") %>%
+  st_transform(4326)
+
+
+# Pull in our outside WSR gage watersheds:
+outside_list <- str_remove(list.files("data/nwis_data/outside"), "\\.csv$")
+
+watersheds_outside <- st_read("data/nwis_ws_backup/outside/") %>% # also found at: "data/archive/shapefiles/watersheds.shp"
+  filter(!site_no %in% watersheds_inside$site_no &
+           site_no %in% outside_list) %>%
+  left_join(., read_csv("data/nwis_data/all_outside_gages.csv") %>% select(site_no, comid), by = "site_no") %>%
+  select(site_no, comid) %>%
+  st_transform(4326)
+
+# Bind together:
+watersheds <- bind_rows(watersheds_inside, watersheds_outside) %>%
+  select(site_no, comid) %>%
+  rowid_to_column(var = "index") %>%  
+  mutate(area = st_area(.),
+         area_sqkm = as.numeric(area)/1000) %>%
+  select(site_no, area_sqkm)
+```
+
+
+
+
+```{r}
+files <- c(list.files("data/nwis_data/inside", full.names = TRUE),
+           list.files("data/nwis_data/outside", full.names = TRUE))
+
+# file <- files[1] #testing
+
+flow_stats <- function(file){
+mmd <- read_csv(file) %>% 
+    mutate(month = month(Date),
+         year = year(Date),
+         wyear = ifelse(month > 9, year + 1, year),
+         site_no = as.character(site_no)) %>%
+  left_join(., watersheds, by = "site_no") %>%
+  mutate(mm_day = 1000 * (X_00060_00003 * 0.028316847000000252 * 86400)/(area_sqkm * 1000000)) %>%
+    distinct(site_no, Date, mm_day, .keep_all = TRUE)
+  
+# LOW AND HIGH FLOW MAGNITUDE
+magnitude_statistics <- mmd %>%
+  group_by(site_no) %>%
+  summarize(low_mag = quantile(mm_day, 0.01, na.rm = TRUE),
+            high_mag = quantile(mm_day, 0.99, na.rm = TRUE)) 
+
+# LOW AND HIGH FLOW VARIABILITY
+variability_statistics <- mmd %>%
+  group_by(site_no, wyear) %>%
+  summarize(min = min(mm_day, na.rm = TRUE),
+            max = max(mm_day, na.rm = TRUE)) %>%
+  group_by(site_no) %>%
+  summarize(sd_min = sd(min, na.rm = TRUE),
+            sd_max = sd(max, na.rm = TRUE),
+            mean_min = mean(min, na.rm = TRUE),
+            mean_max = mean(max, na.rm = TRUE)) %>%
+  mutate(CV_min = ifelse(sd_min == 0, 0, (sd_min/mean_min) * 100),
+         CV_max = (sd_max/mean_max) * 100)
+
+# FREQUENCY OF HIGH AND LOW FLOW PULSES 
+frequency_statistics <- mmd %>%
+  group_by(site_no) %>%
+  summarize(low_pulse = quantile(mm_day, 0.10, na.rm = TRUE),
+            high_pulse = quantile(mm_day, 0.90, na.rm = TRUE))
+
+frequency_pulses <- inner_join(mmd, frequency_statistics, by = 'site_no') %>%
+  group_by(site_no, wyear) %>%
+  mutate(threshold_low = ifelse(mm_day <= low_pulse, 1, 0),
+         threshold_high = ifelse(mm_day >= high_pulse, 1, 0))
+
+frequency_low <- frequency_pulses %>%
+  ungroup() %>%
+  group_by(site_no) %>%
+  mutate(previous = dplyr::lag(threshold_low, 1)) %>%
+  filter(!is.na(previous)) %>%
+  mutate(pulse_event = ifelse(threshold_low == 0, 0,
+                            ifelse(threshold_low == previous, 0, 1))) %>%
+  group_by(site_no, wyear) %>%
+  summarize(count_low_pulse = sum(pulse_event, na.rm = TRUE)) %>%
+  group_by(site_no) %>%
+  summarize(mean_low_pulse_freq = mean(count_low_pulse, na.rm = TRUE)) 
+
+frequency_high <- frequency_pulses %>%
+  ungroup() %>%
+  group_by(site_no) %>%
+  mutate(previous=dplyr::lag(threshold_high, 1)) %>%
+  filter(!is.na(previous)) %>%
+  mutate(pulse_event=ifelse(threshold_high == 0, 0,
+                            ifelse(threshold_high == previous, 0, 1))) %>%
+  group_by(site_no,wyear) %>%
+  summarize(count_high_pulse = sum(pulse_event, na.rm = TRUE)) %>%
+  group_by(site_no) %>%
+  summarize(mean_high_pulse_freq = mean(count_high_pulse, na.rm = TRUE))
+
+# HIGH AND LOW FLOW DURATION
+frequency_duration <- frequency_pulses %>%
+  group_by(site_no, wyear) %>%
+  summarize(low_days = sum(threshold_low, na.rm = TRUE),
+            high_days = sum(threshold_high, na.rm = TRUE)) %>%
+  group_by(site_no) %>%
+  summarize(mean_low_duration = mean(low_days, na.rm = TRUE),
+            mean_high_duration = mean(high_days, na.rm = TRUE))
+
+# SEASONALITY
+mmd <- mmd %>%
+  dplyr::mutate(seasons=ifelse(month >= 1 & month <= 2, "winter",
+                        ifelse(month >= 3 & month <= 5, "spring",
+                        ifelse(month >= 6 & month <= 8, "summer",
+                        ifelse(month >= 9 & month <= 11, "fall",
+                               "winter")))))
+
+mean_annual <- mmd %>% 
+  dplyr::group_by(site_no, wyear) %>%
+  dplyr::summarize(annual_mm = sum(mm_day, na.rm = TRUE))
+
+seasonality <- mmd %>%
+  group_by(site_no, wyear, seasons) %>%
+  summarize(seasonal_flow = sum(mm_day, na.rm = TRUE)) %>%
+  inner_join(mean_annual, by = c("site_no", "wyear")) %>%
+  mutate(fraction = seasonal_flow/annual_mm) %>%
+  group_by(site_no, seasons) %>%
+  summarize(mean_seasonality = mean(fraction, na.rm = TRUE)) %>%
+  mutate(mean_seasonality=ifelse(mean_seasonality == "NaN", 0, mean_seasonality)) %>%
+  pivot_wider(names_from = seasons, values_from = mean_seasonality)
+
+# MEAN ANNUAL FLOW 
+mean_annual <- mmd %>% 
+  dplyr::group_by(site_no, wyear) %>%
+  dplyr::summarize(annual_mm = sum(mm_day, na.rm = TRUE)) %>%
+  group_by(site_no) %>%
+  summarize(mean_annual_mm = mean(annual_mm, na.rm = TRUE))
+
+all_flow_stats <- inner_join(mean_annual, magnitude_statistics) %>%
+  inner_join(variability_statistics) %>%
+  inner_join(frequency_duration) %>%
+  inner_join(frequency_high) %>%
+  inner_join(frequency_low) %>%
+  inner_join(seasonality) %>%
+  select(-c(sd_min, sd_max, mean_min, mean_max))
+
+return(all_flow_stats)
+
+}
+
+flow_stats <- files %>%
+  map_dfr(~flow_stats(.x))  
+```
+
